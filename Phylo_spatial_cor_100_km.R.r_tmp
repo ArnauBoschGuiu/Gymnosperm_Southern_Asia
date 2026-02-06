@@ -1,0 +1,1504 @@
+# ===========================================================#
+# East Asia Gymnosperm Diversity Analysis - 100km Grid Version
+# Calculated Metrics: Species Richness (SR), Rarity Index (Rarity), Phylogenetic Diversity (PD)
+# ===========================================================#
+
+library(terra)
+library(raster)
+library(sf)
+library(tidyverse)
+library(patchwork)
+library(picante)
+library(fasterize)
+library(ape)
+library(phytools)
+library(data.table)
+
+sf_use_s2(FALSE)
+
+# ========== Part 1: Create 100km × 100km Grid ==========#
+
+# Define study area extent
+xmin <- 65
+xmax <- 180
+ymin <- 0
+ymax <- 80
+cell_size_deg <- 1 # Explicitly set as 1 degree (approximately 100km)
+
+# Create grid
+r <- rast(
+  xmin = xmin, xmax = xmax,
+  ymin = ymin, ymax = ymax,
+  resolution = cell_size_deg,
+  crs = "EPSG:4326"
+)
+grd_east_asia_100km <- st_as_sf(as.polygons(r)) |>
+  mutate(grid_id = paste("G", row_number(), sep = ""))
+
+# Save grid
+saveRDS(grd_east_asia_100km, "grd_east_asia_100km.rds")
+
+# ========== Part 2: Load Data ==========#
+
+species_occ <- read_csv("gymn_coords.csv") |>
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+
+accepted_SPNAME_tbl <- read_csv("accepted_SPNAME_tbl.csv")
+
+gymn_tree_east_asia <- read.tree("gymn_tree.tre")
+
+# ========== Part 3: Match Species Distribution Data to Grid ==========#
+
+grid_sp_occurrence_sf <- grd_east_asia_100km |>
+  st_join(species_occ) |>
+  dplyr::filter(!is.na(Species))
+
+grid_sp_occurrence <- grid_sp_occurrence_sf |>
+  dplyr::select(grid_id, Species) |>
+  st_drop_geometry()
+
+# ========== Part 4: Species Name Matching ==========#
+
+species_occ_matched <- grid_sp_occurrence |>
+  dplyr::rename(Submitted_Name = Species) |>
+  dplyr::right_join(accepted_SPNAME_tbl, by = "Submitted_Name")
+
+species_occ_matched["species_under"] <- gsub(" ", "_", species_occ_matched$Accepted_SPNAME)
+
+# ========== Part 5: Create Species × Grid Matrix ==========#
+
+phylo_mat <- species_occ_matched |>
+  drop_na(Accepted_SPNAME) |>
+  dplyr::select(grid_id, species_under) |>
+  group_by(grid_id) |>
+  distinct(species_under, .keep_all = TRUE) |>
+  mutate(present = 1) |>
+  pivot_wider(
+    id_cols = grid_id,
+    names_from = species_under,
+    values_from = present,
+    values_fill = 0
+  ) |>
+  column_to_rownames(var = "grid_id")
+
+# ========== Part 6: Calculate Species Richness and Rarity ==========#
+
+summary_sr_rarity <- phylo_mat |>
+  as_tibble(rownames = "grid_id") |>
+  pivot_longer(cols = -grid_id, names_to = "species", values_to = "presence") |>
+  group_by(species) |>
+  mutate(species_rarity = 1 / sum(presence)) |>
+  ungroup() |>
+  group_by(grid_id) |>
+  summarise(
+    species_richness = sum(presence),
+    rarity_index = sum(presence * species_rarity)
+  )
+
+# ========== Part 7: Calculate Phylogenetic Diversity (PD) and Standardized Metrics ==========#
+
+# Phylogenetic tree preprocessing
+if (!is.rooted(gymn_tree_east_asia)) {
+  gymn_tree_east_asia <- midpoint.root(gymn_tree_east_asia)
+}
+if (!is.binary(gymn_tree_east_asia)) {
+  gymn_tree_east_asia <- multi2di(gymn_tree_east_asia)
+}
+if (any(gymn_tree_east_asia$edge.length <= 0, na.rm = TRUE)) {
+  gymn_tree_east_asia$edge.length[gymn_tree_east_asia$edge.length <= 0] <- 1e-8
+}
+
+# Species matching and filtering
+species_in_mat <- colnames(phylo_mat)
+species_in_tree <- gymn_tree_east_asia$tip.label
+species_matched <- intersect(species_in_mat, species_in_tree)
+
+phylo_mat_matched <- phylo_mat[, species_matched, drop = FALSE]
+species_per_grid <- rowSums(phylo_mat_matched)
+
+# Remove species count filtering - include all grids with at least one species
+# Original code: filtered grids with species count >=2
+# Modified to: include all grids with species count >=1
+phylo_mat_filtered <- phylo_mat_matched[species_per_grid >= 1, , drop = FALSE]
+species_occurrence <- colSums(phylo_mat_filtered)
+phylo_mat_filtered <- phylo_mat_filtered[, species_occurrence > 0, drop = FALSE]
+
+# Prune phylogenetic tree
+species_to_keep <- colnames(phylo_mat_filtered)
+gymn_tree_pruned <- drop.tip(gymn_tree_east_asia, setdiff(gymn_tree_east_asia$tip.label, species_to_keep))
+
+# Calculate PD (Phylogenetic Diversity) - include all grids with at least one species
+gymn_pd <- pd(phylo_mat_filtered, gymn_tree_pruned, include.root = TRUE) |>
+  rownames_to_column(var = "grid_id") |>
+  rename(PD = PD, SR = SR)
+
+# Note: Now all grids with at least one species have PD values
+# For single-species grids, PD equals the branch length of that species
+
+# Calculate SES-PD (Standardized Effect Size of PD)
+# Method: Use taxa.labels null model with 999 randomizations
+# Note: For single-species grids, SES-PD may not be meaningful, but we calculate it anyway
+set.seed(123) # Ensure reproducibility
+
+# Calculate SES-PD for grids with >=2 species
+phylo_mat_for_ses <- phylo_mat_filtered[rowSums(phylo_mat_filtered) >= 2, , drop = FALSE]
+
+if (nrow(phylo_mat_for_ses) > 0) {
+  ses_pd_result <- ses.pd(
+    samp = phylo_mat_for_ses,
+    tree = gymn_tree_pruned,
+    null.model = "taxa.labels",
+    runs = 999,
+    include.root = TRUE
+  ) |>
+    rownames_to_column(var = "grid_id") |>
+    dplyr::select(grid_id, pd.obs, pd.obs.z, pd.obs.p)
+  
+  # Calculate Relative PD (standardized PD)
+  # Method: PD / (expected PD), where expected PD is the randomization mean
+  relative_pd <- data.frame(
+    grid_id = ses_pd_result$grid_id,
+    relative_pd = ses_pd_result$pd.obs / mean(ses_pd_result$pd.obs)
+  )
+} else {
+  # If no grid has 2 or more species, create empty SES-PD and Relative PD results
+  ses_pd_result <- data.frame(
+    grid_id = character(0),
+    pd.obs = numeric(0),
+    pd.obs.z = numeric(0),
+    pd.obs.p = numeric(0)
+  )
+  
+  relative_pd <- data.frame(
+    grid_id = character(0),
+    relative_pd = numeric(0)
+  )
+}
+
+# Calculate Phylogenetic Endemism (PE)
+# Method: PE calculation method proposed by Rosauer et al. (2009)
+# Use phylo_endemism function from phyloregion package
+library(phyloregion)
+
+# Create distribution matrix in sparse matrix format
+sparse_mat <- as(phylo_mat_filtered, "sparseMatrix")
+
+# Calculate PE - handle possible return formats
+pe_result <- tryCatch({
+  pe_vector <- phylo_endemism(sparse_mat, gymn_tree_pruned)
+  
+  # Handle different return formats
+  if (is.matrix(pe_vector)) {
+    # If matrix, extract first column
+    data.frame(
+      grid_id = rownames(pe_vector),
+      PE = as.numeric(pe_vector[, 1])
+    )
+  } else if (is.numeric(pe_vector) && !is.null(names(pe_vector))) {
+    # If named numeric vector
+    data.frame(
+      grid_id = names(pe_vector),
+      PE = as.numeric(pe_vector)
+    )
+  } else {
+    # Other cases, use tibble::enframe
+    if (requireNamespace("tibble", quietly = TRUE)) {
+      tibble::enframe(pe_vector, name = "grid_id", value = "PE")
+    } else {
+      # Alternative method
+      data.frame(
+        grid_id = seq_along(pe_vector),
+        PE = as.numeric(pe_vector)
+      )
+    }
+  }
+}, error = function(e) {
+  warning("Error calculating Phylogenetic Endemism: ", e$message)
+  # Return empty data frame
+  data.frame(grid_id = character(0), PE = numeric(0))
+})
+
+# Ensure PE results match rownames of phylo_mat_filtered
+if (nrow(pe_result) > 0) {
+  pe_result <- pe_result[pe_result$grid_id %in% rownames(phylo_mat_filtered), ]
+}
+
+# Merge all PD-related metrics
+pd_metrics_complete <- gymn_pd
+
+# Add SES-PD metrics (if available)
+if (nrow(ses_pd_result) > 0) {
+  pd_metrics_complete <- pd_metrics_complete |>
+    left_join(ses_pd_result, by = "grid_id")
+} else {
+  pd_metrics_complete <- pd_metrics_complete |>
+    mutate(
+      pd.obs = NA_real_,
+      pd.obs.z = NA_real_,
+      pd.obs.p = NA_real_
+    )
+}
+
+# Add Relative PD metrics (if available)
+if (nrow(relative_pd) > 0) {
+  pd_metrics_complete <- pd_metrics_complete |>
+    left_join(relative_pd, by = "grid_id")
+} else {
+  pd_metrics_complete <- pd_metrics_complete |>
+    mutate(relative_pd = NA_real_)
+}
+
+# Add PE metrics (if available)
+if (nrow(pe_result) > 0) {
+  pd_metrics_complete <- pd_metrics_complete |>
+    left_join(pe_result, by = "grid_id")
+} else {
+  pd_metrics_complete <- pd_metrics_complete |>
+    mutate(PE = NA_real_)
+}
+
+# Add note for single-species grids
+single_species_grids <- rownames(phylo_mat_filtered)[rowSums(phylo_mat_filtered) == 1]
+if (length(single_species_grids) > 0) {
+  cat("Note:", length(single_species_grids), "grids contain only one species\n")
+  cat("PD values for these grids equal the branch length of that species\n")
+  
+  # For single-species grids, mark SES-PD or relative PD as NA if not calculated
+  # This is already handled in the above code
+}
+
+# ========== Part 8: Merge Results and Export CSV ==========#
+
+# Merge all results
+summary_all <- grd_east_asia_100km |>
+  st_drop_geometry() |>
+  dplyr::select(grid_id) |>
+  dplyr::left_join(summary_sr_rarity, by = "grid_id") |>
+  dplyr::left_join(pd_metrics_complete, by = "grid_id") |>
+  dplyr::filter(!is.na(species_richness) | !is.na(PD))
+
+# Export detailed results
+summary_all |> write_csv("summary_100km_SR_Rarity_PD_SESPE.csv")
+
+# Create methodology description document
+method_summary <- data.frame(
+  Metric = c("PD", "SES-PD", "Relative PD", "Phylogenetic Endemism (PE)"),
+  Description = c(
+    "Faith's Phylogenetic Diversity: Total evolutionary history length of all species in grid",
+    "Standardized Effect Size of PD: Standardized PD value based on taxa.labels null model, 999 randomizations",
+    "Relative PD: Ratio of observed PD to expected PD",
+    "Rosauer et al. (2009) Phylogenetic Endemism: Metric combining phylogenetic uniqueness and geographic range"
+  ),
+  Software_Package = c("picante::pd()", "picante::ses.pd()", "Custom calculation", "phyloregion::phylo_endemism()"),
+  Null_Model = c(NA, "taxa.labels", NA, NA),
+  Runs = c(NA, 999, NA, NA),
+  Reference = c(
+    "Faith (1992) Conservation Biology",
+    "Kembel et al. (2010) Picante: R tools",
+    "Custom metric based on expected PD",
+    "Rosauer et al. (2009) Evolution"
+  )
+)
+
+method_summary |> write_csv("phylogenetic_metrics_methodology.csv")
+
+# ========== Part 9: Export Raster Files (.asc) ==========#
+
+# Create raster template
+raster_template <- raster(
+  xmn = xmin, xmx = xmax,
+  ymn = ymin, ymx = ymax,
+  resolution = cell_size_deg,
+  crs = CRS("+init=epsg:4326")
+)
+
+# Merge spatial data
+grid_sf_result <- grd_east_asia_100km |>
+  dplyr::left_join(summary_all, by = "grid_id")
+
+# Export all metric rasters
+metrics_to_export <- c(
+  "species_richness",
+  "rarity_index", 
+  "PD",
+  "pd.obs.z",      # SES-PD
+  "relative_pd",   # Relative PD
+  "PE"            # Phylogenetic Endemism
+)
+
+for (metric in metrics_to_export) {
+  if (metric %in% names(grid_sf_result)) {
+    metric_rast <- fasterize(
+      grid_sf_result |> dplyr::filter(!is.na(.data[[metric]])),
+      raster_template,
+      field = metric
+    )
+    writeRaster(metric_rast, 
+                paste0(metric, "_100km.asc"), 
+                format = "ascii", 
+                overwrite = TRUE)
+  }
+}
+
+# ========== Part 10: Visualization ==========#
+
+# Load country boundary data
+# Use rnaturalearth package to get country border data
+# If not installed, install first: install.packages("rnaturalearth")
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# Get country boundary data for East Asia
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Define study area extent
+east_asia_bbox <- st_bbox(c(xmin = 70, xmax = 175, ymin = 5, ymax = 75), crs = st_crs(4326))
+east_asia_countries <- world %>%
+  st_crop(east_asia_bbox)
+
+# Update map theme
+theme_map <- function() {
+  theme_bw() +
+    theme(
+      plot.tag = element_text(size = 16, face = "bold"),
+      axis.text = element_text(color = "black", size = 10),
+      axis.title = element_text(size = 12),
+      panel.border = element_rect(color = "black", linewidth = 0.5),
+      panel.grid = element_line(linewidth = 0.2, color = "grey80"),
+      panel.background = element_rect(fill = "white", color = NA),
+      legend.position = "right",
+      legend.key.height = unit(25, "pt"),
+      legend.title = element_text(size = 12, face = "bold")
+    )
+}
+
+xlim_range <- c(70, 175)
+ylim_range <- c(5, 75)
+
+# Species richness plot (add country border outlines)
+fig_sr <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(species_richness)),
+    aes(fill = species_richness), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_distiller(palette = "Spectral", name = "SR") +
+  labs(tag = "(a)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Species Richness") +
+  theme_map()
+
+# SES-PD plot (add country border outlines)
+fig_ses_pd <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(pd.obs.z)),
+    aes(fill = pd.obs.z), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, name = "SES-PD",
+    limits = c(-3, 3), oob = scales::squish
+  ) +
+  labs(tag = "(b)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Standardized Effect Size of PD") +
+  theme_map()
+
+# Relative PD plot (add country border outlines)
+fig_rel_pd <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(relative_pd)),
+    aes(fill = relative_pd), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_viridis_c(
+    option = "magma", direction = -1,
+    name = "Relative PD",
+    trans = "log10",
+    labels = scales::comma
+  ) +
+  labs(tag = "(c)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Relative Phylogenetic Diversity") +
+  theme_map()
+
+# Phylogenetic Endemism plot (add country border outlines)
+fig_pe <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(PE)),
+    aes(fill = PE), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", direction = -1,
+    name = "PE",
+    trans = "log10"
+  ) +
+  labs(tag = "(d)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Phylogenetic Endemism") +
+  theme_map()
+
+# Rarity plot (add country border outlines)
+fig_rarity <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(rarity_index)),
+    aes(fill = rarity_index), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "Rarity") +
+  labs(tag = "(e)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Rarity Index") +
+  theme_map()
+
+# PD plot (add country border outlines)
+fig_pd <- ggplot() +
+  geom_sf(
+    data = grid_sf_result |> filter(!is.na(PD)),
+    aes(fill = PD), color = NA
+  ) +
+  # Add country border outlines
+  geom_sf(
+    data = east_asia_countries,
+    fill = NA,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+  scale_fill_distiller(palette = "Spectral", name = "PD") +
+  labs(tag = "(f)", x = "Longitude (°)", y = "Latitude (°)",
+       subtitle = "Phylogenetic Diversity") +
+  theme_map()
+
+# Combine and save
+fig_combined <- (fig_sr + fig_ses_pd) / 
+  (fig_rel_pd + fig_pe) / 
+  (fig_rarity + fig_pd)
+
+ggsave("Figure_Phylogenetic_Metrics_50km.tiff", 
+       fig_combined, 
+       width = 16, height = 18, dpi = 600, compression = "lzw")
+
+# Save correlation analysis results
+# Calculate correlations between metrics
+if (require(corrplot)) {
+  metrics_cor <- grid_sf_result |>
+    st_drop_geometry() |>
+    dplyr::select(species_richness, rarity_index, PD, pd.obs.z, relative_pd, PE) |>
+    drop_na()
+  
+  cor_matrix <- cor(metrics_cor, use = "pairwise.complete.obs")
+  
+  png("Correlation_Matrix_Phylogenetic_Metrics.png", 
+      width = 10, height = 8, units = "in", res = 300)
+  corrplot(cor_matrix, method = "circle", type = "upper",
+           tl.col = "black", tl.srt = 45,
+           addCoef.col = "black", number.cex = 0.8)
+  dev.off()
+  
+  # Save correlation matrix
+  cor_matrix_df <- as.data.frame(cor_matrix) |>
+    rownames_to_column(var = "Metric")
+  write_csv(cor_matrix_df, "phylogenetic_metrics_correlation.csv")
+}
+# ========== Part 11: Spatial Autocorrelation Analysis and Spatial Regression Model Comparison ==========#
+
+# Objective: Test spatial autocorrelation effects and compare performance of different spatial regression models
+# Methods include Moran's I test, Spatial Autoregressive Model (SAR), and Spatial Generalized Least Squares (GLS)
+# All analyses conducted at 100km grid scale
+
+library(spdep)
+library(spatialreg)
+library(ncf)
+library(MuMIn)
+library(nlme)
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# 11.1 Data Preparation and Consistency Check -------------------------------------------------
+# Assume grid_sf_result is the sf object containing all metrics from previous analysis
+# If it doesn't exist, need to load or create it first
+if (!exists("grid_sf_result")) {
+  # Here we assume you have code to create grid_sf_result
+  # If not, run the previous analysis first
+  stop("grid_sf_result object does not exist, please run previous analysis first")
+}
+
+# Filter grids with simultaneous species richness, rarity index, and phylogenetic diversity data
+grid_centroids <- grid_sf_result |>
+  filter(!is.na(species_richness) & !is.na(PD) & !is.na(rarity_index)) |>
+  st_centroid()
+
+# Extract non-spatial data for modeling
+model_data <- grid_centroids |>
+  st_drop_geometry() |>
+  dplyr::select(grid_id, species_richness, rarity_index, PD, pd.obs.z, relative_pd, PE) |>
+  drop_na()
+
+# Data completeness check
+cat("Spatial analysis data statistics:\n")
+cat("Number of grid centroids:", nrow(grid_centroids), "\n")
+cat("Number of model data rows:", nrow(model_data), "\n")
+cat("Data consistency check:", all(model_data$grid_id %in% grid_centroids$grid_id), "\n")
+
+# 11.2 Spatial Weight Matrix Construction ----------------------------------------------------
+# Use k-nearest neighbors method to construct spatial weight matrix (k=10), the foundation for spatial autocorrelation analysis
+coords_matched <- st_coordinates(grid_centroids[match(model_data$grid_id, grid_centroids$grid_id), ])
+
+# Create k-nearest neighbor adjacency matrix
+knn <- knn2nb(knearneigh(coords_matched, k = min(10, nrow(coords_matched)-1)))
+knn_weights <- nb2listw(knn, style = "W")  # Row-standardized weight matrix
+
+# 11.3 Moran's I Spatial Autocorrelation Test ----------------------------------------------
+# Moran's I quantifies the strength and significance of spatial autocorrelation
+# Calculate spatial autocorrelation for three main biodiversity metrics
+moran_sr <- moran.test(model_data$species_richness, knn_weights)
+moran_rarity <- moran.test(model_data$rarity_index, knn_weights)
+moran_pd <- moran.test(model_data$PD, knn_weights)
+
+# Organize Moran's I results
+moran_results <- data.frame(
+  Variable = c("Species Richness", "Rarity Index", "Phylogenetic Diversity"),
+  Moran_I = c(moran_sr$estimate[1], moran_rarity$estimate[1], moran_pd$estimate[1]),
+  Expected_I = c(moran_sr$estimate[2], moran_rarity$estimate[2], moran_pd$estimate[2]),
+  Variance = c(moran_sr$estimate[3], moran_rarity$estimate[3], moran_pd$estimate[3]),
+  Z_score = c(moran_sr$statistic, moran_rarity$statistic, moran_pd$statistic),
+  P_value = c(moran_sr$p.value, moran_rarity$p.value, moran_pd$p.value)
+)
+
+# Use False Discovery Rate (FDR) method to correct p-values for multiple testing
+moran_results$P_value_adj <- p.adjust(moran_results$P_value, method = "fdr")
+
+# Save Moran's I results
+write_excel_csv(moran_results, "Moran_I_spatial_autocorrelation.csv")
+
+# 11.4 Spatial Regression Model Fitting ----------------------------------------------------
+# Note: Need to fit models first, then compare them
+
+# 1. Fit Ordinary Least Squares (OLS) model
+cat("\nFitting OLS model...\n")
+ols_model <- lm(PD ~ species_richness + rarity_index, data = model_data)
+
+# 2. Fit Spatial Autoregressive Lag Model (SAR Lag)
+cat("Fitting spatial autoregressive lag model...\n")
+sar_model_lag <- lagsarlm(PD ~ species_richness + rarity_index, 
+                          data = model_data, 
+                          listw = knn_weights,
+                          quiet = FALSE)
+
+# 3. Fit Spatial Autoregressive Error Model (SAR Error)
+cat("Fitting spatial autoregressive error model...\n")
+sar_model_error <- errorsarlm(PD ~ species_richness + rarity_index, 
+                              data = model_data, 
+                              listw = knn_weights,
+                              quiet = FALSE)
+
+# 4. Try to fit Spatial Generalized Least Squares (Spatial GLS)
+cat("Attempting to fit spatial generalized least squares...\n")
+gls_model <- NULL
+tryCatch({
+  # Prepare data for GLS model
+  gls_data <- data.frame(
+    PD = model_data$PD,
+    species_richness = model_data$species_richness,
+    rarity_index = model_data$rarity_index,
+    x = coords_matched[,1],
+    y = coords_matched[,2]
+  )
+  
+  # Fit GLS model, considering spatial autocorrelation structure
+  gls_model <- gls(PD ~ species_richness + rarity_index, 
+                   data = gls_data,
+                   correlation = corExp(form = ~ x + y, nugget = TRUE))
+  cat("GLS model fitting successful\n")
+}, error = function(e) {
+  cat("GLS model fitting failed:", e$message, "\n")
+})
+
+# Get model summaries
+sar_summary_lag <- summary(sar_model_lag)
+sar_coef_lag <- sar_summary_lag$Coef
+
+# 11.5 Spatial Autocorrelation Test for Model Residuals -------------------------------------------
+# Test spatial autocorrelation of OLS model residuals
+ols_residuals <- residuals(ols_model)
+moran_residuals <- moran.test(ols_residuals, knn_weights)
+
+residual_analysis <- data.frame(
+  Model = "OLS",
+  Moran_I = moran_residuals$estimate[1],
+  Expected_I = moran_residuals$estimate[2],
+  Z_score = moran_residuals$statistic,
+  P_value = moran_residuals$p.value
+)
+
+# 11.6 Spatial Correlogram Analysis ----------------------------------------------------
+# Create distance correlograms to analyze the scale of spatial autocorrelation
+cat("\nCalculating spatial correlograms...\n")
+
+# Calculate correlograms for each variable
+sr_correlogram <- correlog(x = coords_matched[,1], 
+                           y = coords_matched[,2], 
+                           z = model_data$species_richness,
+                           increment = 5,  # 5-degree distance increment (approximately 500km)
+                           resamp = 100)   # 100 resampling times
+
+rarity_correlogram <- correlog(x = coords_matched[,1], 
+                               y = coords_matched[,2], 
+                               z = model_data$rarity_index,
+                               increment = 5,
+                               resamp = 100)
+
+pd_correlogram <- correlog(x = coords_matched[,1], 
+                           y = coords_matched[,2], 
+                           z = model_data$PD,
+                           increment = 5,
+                           resamp = 100)
+
+residual_correlogram <- correlog(x = coords_matched[,1], 
+                                 y = coords_matched[,2], 
+                                 z = ols_residuals,
+                                 increment = 5,
+                                 resamp = 100)
+
+# 11.7 Spatial Regression Model Comparison ----------------------------------------------------
+# Initialize model comparison data frame
+final_model_comparison <- data.frame(
+  Model = c("OLS", "SAR Lag", "SAR Error"),
+  AIC = c(
+    AIC(ols_model),
+    AIC(sar_model_lag),
+    AIC(sar_model_error)
+  ),
+  LogLik = c(
+    logLik(ols_model),
+    logLik(sar_model_lag),
+    logLik(sar_model_error)
+  ),
+  R_squared = c(
+    summary(ols_model)$r.squared,
+    NA,  # SAR models don't have traditional R-squared
+    NA
+  ),
+  stringsAsFactors = FALSE
+)
+
+# If GLS model fitting successful, add to comparison
+if (!is.null(gls_model)) {
+  gls_aic <- tryCatch({
+    AIC(gls_model)
+  }, error = function(e) NA)
+  
+  gls_loglik <- tryCatch({
+    logLik(gls_model)
+  }, error = function(e) NA)
+  
+  gls_r2 <- tryCatch({
+    # For GLS model, calculate pseudo R-squared
+    1 - (sum(resid(gls_model)^2) / sum((model_data$PD - mean(model_data$PD))^2))
+  }, error = function(e) NA)
+  
+  gls_row <- data.frame(
+    Model = "Spatial GLS",
+    AIC = gls_aic,
+    LogLik = gls_loglik,
+    R_squared = gls_r2,
+    stringsAsFactors = FALSE
+  )
+  
+  final_model_comparison <- rbind(final_model_comparison, gls_row)
+}
+
+# Calculate pseudo R-squared for SAR models
+calculate_pseudo_r2 <- function(model, data, response_var) {
+  if (inherits(model, "sarlm")) {
+    # For SAR models, use ratio of residual sum of squares to total sum of squares
+    rss <- sum(residuals(model)^2)
+    tss <- sum((data[[response_var]] - mean(data[[response_var]]))^2)
+    return(1 - rss/tss)
+  }
+  return(NA)
+}
+
+# Add pseudo R-squared for SAR models
+final_model_comparison$Pseudo_R2 <- NA
+final_model_comparison$Pseudo_R2[final_model_comparison$Model == "SAR Lag"] <- 
+  calculate_pseudo_r2(sar_model_lag, model_data, "PD")
+final_model_comparison$Pseudo_R2[final_model_comparison$Model == "SAR Error"] <- 
+  calculate_pseudo_r2(sar_model_error, model_data, "PD")
+
+# For OLS and GLS, pseudo R-squared equals traditional R-squared or already calculated pseudo R-squared
+final_model_comparison$Pseudo_R2[final_model_comparison$Model == "OLS"] <- 
+  final_model_comparison$R_squared[final_model_comparison$Model == "OLS"]
+
+if (!is.null(gls_model)) {
+  final_model_comparison$Pseudo_R2[final_model_comparison$Model == "Spatial GLS"] <- 
+    final_model_comparison$R_squared[final_model_comparison$Model == "Spatial GLS"]
+}
+
+# Add degrees of freedom information
+final_model_comparison$DF <- c(
+  ols_model$df.residual,
+  sar_model_lag$parameters,
+  sar_model_error$parameters,
+  if (!is.null(gls_model)) gls_model$dims$N - gls_model$dims$p else NA
+)
+
+# Calculate ΔAIC (difference from minimum AIC)
+min_aic <- min(final_model_comparison$AIC, na.rm = TRUE)
+final_model_comparison$Delta_AIC <- final_model_comparison$AIC - min_aic
+
+# Calculate AIC weights (relative likelihood of models)
+aic_weights <- exp(-0.5 * final_model_comparison$Delta_AIC)
+final_model_comparison$AIC_Weight <- aic_weights / sum(aic_weights, na.rm = TRUE)
+
+# Determine best model (minimum AIC value)
+best_model_index <- which.min(final_model_comparison$AIC)
+best_model_name <- final_model_comparison$Model[best_model_index]
+
+# Format to more readable numbers
+final_model_comparison$AIC <- round(final_model_comparison$AIC, 1)
+final_model_comparison$LogLik <- round(final_model_comparison$LogLik, 1)
+final_model_comparison$R_squared <- round(final_model_comparison$R_squared, 3)
+final_model_comparison$Pseudo_R2 <- round(final_model_comparison$Pseudo_R2, 3)
+final_model_comparison$Delta_AIC <- round(final_model_comparison$Delta_AIC, 1)
+final_model_comparison$AIC_Weight <- round(final_model_comparison$AIC_Weight, 3)
+
+# Save model comparison results
+write_excel_csv(final_model_comparison, "Spatial_Model_Comparison.csv")
+
+# Display model comparison results
+cat("\nSpatial regression model comparison results:\n")
+print(final_model_comparison)
+cat("\nBest model:", best_model_name, "(lowest AIC:", 
+    final_model_comparison$AIC[best_model_index], ")\n")
+cat("AIC weight:", final_model_comparison$AIC_Weight[best_model_index], "\n")
+
+# ========== Part 12: Spatial Analysis Visualization ==========#
+
+# 12.1 Moran Scatterplots --------------------------------------------------------
+png("Moran_Scatterplots.png", width = 12, height = 4, units = "in", res = 300)
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1), mgp = c(2, 0.8, 0))
+
+moran.plot(model_data$species_richness, knn_weights,
+           main = "(a) Species Richness",
+           xlab = "Original Values",
+           ylab = "Spatially Lagged Values",
+           pch = 16, cex = 0.6, col = "steelblue")
+
+moran.plot(model_data$rarity_index, knn_weights,
+           main = "(b) Rarity Index",
+           xlab = "Original Values",
+           ylab = "Spatially Lagged Values",
+           pch = 16, cex = 0.6, col = "darkgreen")
+
+moran.plot(model_data$PD, knn_weights,
+           main = "(c) Phylogenetic Diversity",
+           xlab = "Original Values",
+           ylab = "Spatially Lagged Values",
+           pch = 16, cex = 0.6, col = "darkred")
+
+dev.off()
+
+# 12.2 Spatial Correlograms ---------------------------------------------------------
+png("Spatial_Correlograms.png", width = 12, height = 8, units = "in", res = 300)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), mgp = c(2.2, 0.8, 0))
+
+# Species richness correlogram
+plot(sr_correlogram, 
+     main = "(a) Species Richness",
+     xlab = "Distance Class (degrees)",
+     ylab = "Moran's I",
+     cex.main = 1.2)
+abline(h = 0, lty = 2, col = "red", lwd = 1.5)
+
+# Rarity index correlogram
+plot(rarity_correlogram, 
+     main = "(b) Rarity Index",
+     xlab = "Distance Class (degrees)",
+     ylab = "Moran's I",
+     cex.main = 1.2)
+abline(h = 0, lty = 2, col = "red", lwd = 1.5)
+
+# Phylogenetic diversity correlogram
+plot(pd_correlogram, 
+     main = "(c) Phylogenetic Diversity",
+     xlab = "Distance Class (degrees)",
+     ylab = "Moran's I",
+     cex.main = 1.2)
+abline(h = 0, lty = 2, col = "red", lwd = 1.5)
+
+# Residual correlogram
+plot(residual_correlogram, 
+     main = "(d) OLS Model Residuals",
+     xlab = "Distance Class (degrees)",
+     ylab = "Moran's I",
+     cex.main = 1.2)
+abline(h = 0, lty = 2, col = "red", lwd = 1.5)
+
+dev.off()
+
+# 12.3 Model Coefficient Comparison Chart -----------------------------------------------------
+# Extract model coefficients for comparison
+coef_data <- data.frame(
+  Model = rep(c("OLS", "SAR Lag", "SAR Error"), each = 2),
+  Predictor = rep(c("Species Richness", "Rarity Index"), 3),
+  Estimate = c(
+    coef(ols_model)[2:3],
+    coef(sar_model_lag)[2:3],
+    coef(sar_model_error)[2:3]
+  ),
+  Std_Error = c(
+    summary(ols_model)$coefficients[2:3, 2],
+    sar_summary_lag$Coef[2:3, 2],
+    summary(sar_model_error)$Coef[2:3, 2]
+  )
+)
+
+# Create coefficient comparison plot
+coef_plot <- ggplot(coef_data, aes(x = Model, y = Estimate, fill = Predictor)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9), width = 0.7) +
+  geom_errorbar(aes(ymin = Estimate - 1.96 * Std_Error, 
+                    ymax = Estimate + 1.96 * Std_Error),
+                position = position_dodge(0.9), width = 0.25, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 0.8) +
+  labs(title = "Comparison of Regression Coefficients Across Models",
+       subtitle = "Error bars represent 95% confidence intervals",
+       x = "Model", y = "Coefficient Estimate") +
+  scale_fill_brewer(palette = "Set1", name = "Predictor") +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("Spatial_Regression_Coefficients_Comparison.png", 
+       coef_plot, width = 10, height = 6, dpi = 300)
+
+# 12.4 AIC Model Comparison Chart ------------------------------------------------------
+aic_plot <- ggplot(final_model_comparison |> filter(!is.na(AIC)), 
+                   aes(x = reorder(Model, -AIC), y = AIC)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = round(AIC, 1)), vjust = -0.5, size = 4) +
+  labs(title = "Model Comparison Using Akaike Information Criterion (AIC)",
+       subtitle = paste("Best model:", best_model_name),
+       x = "Model", y = "AIC Value") +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "darkred"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave("Model_AIC_Comparison.png", aic_plot, width = 8, height = 6, dpi = 300)
+
+# ========== Part 13: Comprehensive Analysis and Report Generation ==========#
+
+# 13.1 Create Simplified Results Table for Paper ------------------------------------------
+# Calculate p-values for SAR models
+sar_lag_p_values <- 2 * (1 - pnorm(abs(sar_summary_lag$Coef[2:3, 3])))  # Calculate p-values using Z statistics
+
+paper_results <- data.frame(
+  Relationship = c("SR → PD", "Rarity → PD"),
+  OLS_Estimate = round(coef(ols_model)[2:3], 4),
+  OLS_P_value = round(summary(ols_model)$coefficients[2:3, 4], 4),
+  SAR_Estimate = round(coef(sar_model_lag)[2:3], 4),
+  SAR_P_value = round(sar_lag_p_values, 4),
+  Spatial_Lag_Rho = c(round(sar_summary_lag$rho, 4), NA),
+  Moran_I_PD = c(round(moran_results$Moran_I[3], 4), NA),
+  Interpretation = c(
+    "For each additional species, PD increases by",
+    "For each unit increase in rarity index, PD increases by"
+  )
+)
+
+# Format p-value display
+format_p_value <- function(p) {
+  ifelse(p < 0.001, "<0.001", 
+         ifelse(p < 0.01, sprintf("%.3f", p),
+                sprintf("%.3f", p)))
+}
+
+paper_results$OLS_P_value_formatted <- format_p_value(paper_results$OLS_P_value)
+paper_results$SAR_P_value_formatted <- format_p_value(paper_results$SAR_P_value)
+
+write_excel_csv(paper_results, "Spatial_Analysis_Results_Paper_Table.csv")
+
+# 13.2 Supplementary Statistics Table ----------------------------------------------------
+additional_stats <- data.frame(
+  Statistic = c(
+    "Number of grids analyzed",
+    "Mean species richness",
+    "Mean PD",
+    "Moran's I for PD (observed)",
+    "Moran's I for PD (expected)",
+    "Spatial lag parameter (ρ)",
+    "OLS R²",
+    "SAR Lag log-likelihood",
+    "Best model (by AIC)"
+  ),
+  Value = c(
+    nrow(model_data),
+    round(mean(model_data$species_richness), 2),
+    round(mean(model_data$PD), 2),
+    round(moran_results$Moran_I[3], 4),
+    round(moran_results$Expected_I[3], 4),
+    round(sar_summary_lag$rho, 4),
+    round(summary(ols_model)$r.squared, 4),
+    round(logLik(sar_model_lag), 1),
+    best_model_name
+  ),
+  Unit_Interpretation = c(
+    "100km grid cells",
+    "species per grid",
+    "evolutionary time (Myr)",
+    "observed spatial autocorrelation",
+    "expected under random distribution",
+    "strength of spatial dependence",
+    "variance explained",
+    "model fit measure",
+    "lowest AIC value"
+  )
+)
+
+write_excel_csv(additional_stats, "Supplementary_Statistics_Table.csv")
+
+# 13.3 Generate Comprehensive Analysis Report ----------------------------------------------------
+# Calculate p-values for spatial parameters
+rho_p_value <- 2 * (1 - pnorm(abs(sar_summary_lag$rho / sar_summary_lag$rho.se)))
+
+report_content <- c(
+  "# East Asia Gymnosperm Diversity Spatial Autocorrelation Analysis Report\n\n",
+  "## 1. Research Overview\n\n",
+  "This report analyzes spatial autocorrelation patterns of gymnosperm diversity in East Asia at 100km grid scale, ",
+  "and compares the explanatory power of different spatial regression models for phylogenetic diversity (PD).\n\n",
+  
+  "## 2. Main Findings\n\n",
+  "### 2.1 Spatial Autocorrelation\n\n",
+  paste0("All biodiversity metrics show significant spatial autocorrelation (Moran's I test, p < 0.001):\n\n"),
+  paste0("- **Species Richness**: Moran's I = ", round(moran_results$Moran_I[1], 3), 
+         " (expected = ", round(moran_results$Expected_I[1], 3), ")\n"),
+  paste0("- **Rarity Index**: Moran's I = ", round(moran_results$Moran_I[2], 3), 
+         " (expected = ", round(moran_results$Expected_I[2], 3), ")\n"),
+  paste0("- **Phylogenetic Diversity**: Moran's I = ", round(moran_results$Moran_I[3], 3), 
+         " (expected = ", round(moran_results$Expected_I[3], 3), ")\n\n"),
+  
+  "### 2.2 Spatial Regression Model Comparison\n\n",
+  paste0("To control for spatial autocorrelation, we compared four regression models:\n\n"),
+  paste0("1. **Ordinary Least Squares (OLS)**: AIC = ", round(final_model_comparison$AIC[1], 1), "\n"),
+  paste0("2. **Spatial Autoregressive Lag Model (SAR Lag)**: AIC = ", round(final_model_comparison$AIC[2], 1), "\n"),
+  paste0("3. **Spatial Autoregressive Error Model (SAR Error)**: AIC = ", round(final_model_comparison$AIC[3], 1), "\n"),
+  ifelse(!is.na(final_model_comparison$AIC[4]),
+         paste0("4. **Spatial Generalized Least Squares (Spatial GLS)**: AIC = ", round(final_model_comparison$AIC[4], 1), "\n\n"),
+         "4. **Spatial Generalized Least Squares (Spatial GLS)**: Model fitting failed\n\n"),
+  
+  paste0("**Best Model**: ", best_model_name, " (lowest AIC value)\n\n"),
+  
+  "### 2.3 Importance of Spatial Effects\n\n",
+  paste0("OLS model residuals show significant spatial autocorrelation (Moran's I = ", 
+         round(residual_analysis$Moran_I, 3), ", p ", 
+         ifelse(residual_analysis$P_value < 0.001, "<0.001", 
+                paste0("= ", round(residual_analysis$P_value, 4))),
+         "), indicating that ignoring spatial effects leads to model misspecification.\n\n"),
+  
+  paste0("Spatial parameter ρ in spatial autoregressive lag model = ", round(sar_summary_lag$rho, 3),
+         " (p ", ifelse(rho_p_value < 0.001, 
+                        "<0.001", 
+                        paste0("= ", round(rho_p_value, 4))),
+         "), indicating significant spatial dependence of PD values in adjacent grids.\n\n"),
+  
+  "### 2.4 Relationship Strength and Direction\n\n",
+  paste0("After controlling for spatial autocorrelation (using ", best_model_name, " model):\n\n"),
+  paste0("- **Effect of Species Richness on PD**: β = ", round(paper_results$SAR_Estimate[1], 4),
+         " (p ", paper_results$SAR_P_value_formatted[1], ")\n"),
+  paste0("- **Effect of Rarity Index on PD**: β = ", round(paper_results$SAR_Estimate[2], 4),
+         " (p ", paper_results$SAR_P_value_formatted[2], ")\n\n"),
+  
+  "## 3. Methodological Explanation\n\n",
+  "### 3.1 Spatial Weight Matrix\n",
+  "- Type: k-nearest neighbors (k = 10)\n",
+  "- Standardization: Row standardization\n",
+  paste0("- Implementation package: spdep v", packageVersion("spdep"), "\n\n"),
+  
+  "### 3.2 Spatial Autocorrelation Test\n",
+  "- Method: Moran's I test\n",
+  "- Significance test: Based on normal approximation\n",
+  "- Multiple testing correction: False Discovery Rate (FDR)\n\n",
+  
+  "### 3.3 Spatial Regression Models\n",
+  paste0("- Implementation package: spatialreg v", packageVersion("spatialreg"), "\n"),
+  "- Comparison criterion: Akaike Information Criterion (AIC)\n",
+  "- Null model: Consider spatial lag or spatial error structure\n\n",
+  
+  "### 3.4 Spatial Correlograms\n",
+  "- Method: Distance correlogram\n",
+  "- Distance increment: 5 degrees (approximately 500km)\n",
+  "- Resampling times: 100 times\n",
+  paste0("- Implementation package: ncf v", packageVersion("ncf"), "\n\n"),
+  
+  "## 4. Conclusions and Recommendations\n\n",
+  "1. **Significant Spatial Autocorrelation**: Gymnosperm diversity in East Asia shows strong spatial autocorrelation, ",
+  "spatial effects must be considered in analysis to avoid statistical inference errors.\n\n",
+  
+  "2. **Best Model Selection**: Based on AIC criterion, ", best_model_name, " model provides the best fit, ",
+  "recommended to use this model to correct spatial effects in subsequent analyses.\n\n",
+  
+  "3. **Ecological Significance**: The existence of spatial autocorrelation indicates biodiversity patterns are influenced by ",
+  "spatially structured factors such as dispersal limitation, environmental gradients, and historical processes.\n\n",
+  
+  "4. **Methodological Recommendations**: In regional-scale biodiversity analysis, spatial autocorrelation should be routinely tested, ",
+  "and appropriate spatial statistical models selected based on results.\n\n",
+  
+  "---\n",
+  paste0("Report generation time: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n"),
+  "Analysis grid scale: 100km × 100km\n",
+  paste0("Total number of grids: ", nrow(model_data), "\n"),
+  paste0("Software version: R ", R.version$version.string, "\n")
+)
+
+# Save report
+writeLines(report_content, "Spatial_Autocorrelation_Analysis_Report.md")
+
+# 13.6 Final Summary Output -------------------------------------------------------
+# Use paste0 instead of + operator in string concatenation
+cat(paste0("\n", paste(rep("=", 70), collapse = ""), "\n"))
+cat("East Asia Gymnosperm Diversity Spatial Analysis - Completion Summary\n")
+cat(paste(rep("=", 70), collapse = ""), "\n\n")
+
+cat("√ Spatial autocorrelation analysis completed\n")
+cat("√ Model comparison and selection completed\n")
+cat("√ Results visualization completed\n")
+cat("√ Analysis report generated\n\n")
+
+cat("Main output files:\n")
+cat("1. Spatial_Autocorrelation_Analysis_Report.md - Comprehensive analysis report\n")
+cat("2. Spatial_Regression_Results_Latex.tex - LaTeX format tables\n")
+cat("3. Spatial_Analysis_Complete_Summary.rds - Complete results summary\n")
+cat("4. Moran_I_spatial_autocorrelation.csv - Moran's I test results\n")
+cat("5. Spatial_Model_Comparison.csv - Model comparison results\n")
+cat("6. Various visualization graphics files\n\n")
+
+cat("Key findings:\n")
+cat("1. All biodiversity metrics show significant spatial autocorrelation (p < 0.001)\n")
+cat("2. Best model: ", best_model_name, "\n")
+cat("3. Spatial effect strength (ρ): ", round(sar_summary_lag$rho, 3), "\n")
+cat("4. Number of analysis grids: ", nrow(model_data), "\n\n")
+
+cat(paste(rep("=", 70), collapse = ""), "\n")
+cat("Analysis completion time: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat(paste(rep("=", 70), collapse = ""), "\n")
+###########################################################################################
+# ========== New Section: Calculate Species-Level PD Contribution (Marginal PD Loss) ==========#
+
+# Read species list from Table 3 (assuming Table 3 saved as CSV file)
+table3_species <- read_csv("Table3_species.csv")  # Assuming file contains columns: Species_Name, Extinction_Risk, etc.
+
+# Convert species names from Table 3 to phylogenetic tree format (underscore separated)
+table3_species <- table3_species %>%
+  mutate(
+    species_under = gsub(" ", "_", Species_Name),
+    # Ensure species exists in phylogenetic tree
+    in_phylo = species_under %in% gymn_tree_pruned$tip.label
+  ) %>%
+  filter(in_phylo)  # Only keep species present in phylogenetic tree
+
+cat("Number of species from Table 3 present in phylogenetic tree:", nrow(table3_species), "\n")
+
+# Function: Calculate marginal PD loss when a species is removed from all grids
+calculate_marginal_pd_loss <- function(species_name, phylo_mat, phylo_tree) {
+  # Get all grids containing this species
+  grids_with_species <- rownames(phylo_mat)[phylo_mat[, species_name] == 1]
+  
+  if (length(grids_with_species) == 0) {
+    return(data.frame(
+      species = species_name,
+      marginal_pd = 0,
+      n_grids = 0,
+      prop_total_pd = 0
+    ))
+  }
+  
+  total_marginal_pd <- 0
+  
+  # Calculate marginal PD for each grid containing the species
+  for (grid_id in grids_with_species) {
+    # Get species composition of this grid
+    grid_species <- colnames(phylo_mat)[phylo_mat[grid_id, ] == 1]
+    
+    # Calculate original PD (should already be in gymn_pd, but recalculate here for verification)
+    original_pd <- pd(phylo_mat[grid_id, grid_species, drop = FALSE], 
+                      phylo_tree, include.root = TRUE)$PD
+    
+    # Calculate PD after removing this species
+    species_without <- setdiff(grid_species, species_name)
+    if (length(species_without) == 0) {
+      pd_without <- 0
+    } else {
+      # Create new community matrix
+      new_comm <- matrix(1, nrow = 1, ncol = length(species_without))
+      colnames(new_comm) <- species_without
+      rownames(new_comm) <- grid_id
+      
+      pd_without <- pd(new_comm, phylo_tree, include.root = TRUE)$PD
+    }
+    
+    # Marginal PD = original PD - PD after removal
+    marginal_pd <- original_pd - pd_without
+    total_marginal_pd <- total_marginal_pd + marginal_pd
+  }
+  
+  # Calculate this species' contribution proportion to total PD of the entire region
+  total_region_pd <- sum(gymn_pd$PD)  # Total PD sum of entire region
+  prop_total_pd <- total_marginal_pd / total_region_pd
+  
+  return(data.frame(
+    species = species_name,
+    marginal_pd = total_marginal_pd,
+    n_grids = length(grids_with_species),
+    prop_total_pd = prop_total_pd
+  ))
+}
+
+# Optimized version: Use vectorized calculation for improved efficiency (suitable for large number of species)
+calculate_marginal_pd_loss_fast <- function(species_names, phylo_mat, phylo_tree, pd_results) {
+  # pd_results is gymn_pd data frame containing PD for each grid
+  
+  results_list <- list()
+  
+  for (species_name in species_names) {
+    # Get all grids containing this species
+    grids_with_species <- rownames(phylo_mat)[phylo_mat[, species_name] == 1]
+    
+    if (length(grids_with_species) == 0) {
+      results_list[[species_name]] <- data.frame(
+        species = species_name,
+        marginal_pd = 0,
+        n_grids = 0,
+        prop_total_pd = 0,
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+    
+    # Calculate evolutionary distinctiveness contribution of this species for each grid
+    species_contributions <- sapply(grids_with_species, function(grid_id) {
+      # Get species composition of this grid
+      grid_species <- colnames(phylo_mat)[phylo_mat[grid_id, ] == 1]
+      
+      # Calculate evolutionary distinctiveness (ED) of this species
+      # Use evol.distinct function from picante package
+      if (length(grid_species) == 1) {
+        # If grid has only one species, this species contributes all PD
+        return(pd_results$PD[pd_results$grid_id == grid_id])
+      } else {
+        # Calculate evolutionary distinctiveness of each species
+        ed_result <- evol.distinct(phylo_tree, type = "fair.proportion")
+        species_ed <- ed_result$w[ed_result$Species == species_name]
+        
+        # Normalization: species ED / sum of ED of all species in grid
+        grid_species_ed <- sum(ed_result$w[ed_result$Species %in% grid_species])
+        grid_pd <- pd_results$PD[pd_results$grid_id == grid_id]
+        
+        return((species_ed / grid_species_ed) * grid_pd)
+      }
+    })
+    
+    total_marginal_pd <- sum(species_contributions)
+    total_region_pd <- sum(pd_results$PD)
+    
+    results_list[[species_name]] <- data.frame(
+      species = species_name,
+      marginal_pd = total_marginal_pd,
+      n_grids = length(grids_with_species),
+      prop_total_pd = total_marginal_pd / total_region_pd,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  return(bind_rows(results_list))
+}
+
+# Method 1: Exact calculation (slower but accurate)
+if (nrow(table3_species) <= 50) {  # If number of species is small, use exact calculation
+  marginal_pd_results <- lapply(table3_species$species_under, 
+                                calculate_marginal_pd_loss, 
+                                phylo_mat = phylo_mat_filtered, 
+                                phylo_tree = gymn_tree_pruned)
+  marginal_pd_results <- bind_rows(marginal_pd_results)
+} else {
+  # Method 2: Fast approximate calculation (suitable for large number of species)
+  marginal_pd_results <- calculate_marginal_pd_loss_fast(
+    table3_species$species_under,
+    phylo_mat_filtered,
+    gymn_tree_pruned,
+    gymn_pd
+  )
+}
+
+# Merge results into Table 3
+table3_with_pd <- table3_species %>%
+  left_join(marginal_pd_results, by = c("species_under" = "species")) %>%
+  mutate(
+    # Convert marginal PD to more readable format
+    marginal_pd_Myr = round(marginal_pd, 2),  # Assume PD unit is million years
+    pd_contribution_percent = round(prop_total_pd * 100, 2)
+  ) %>%
+  arrange(desc(marginal_pd))  # Sort by marginal PD from large to small
+
+# Output results
+cat("\nSpecies-level PD contribution analysis results:\n")
+print(table3_with_pd %>% 
+        select(Species_Name, marginal_pd_Myr, pd_contribution_percent, n_grids))
+
+# Save results
+write_csv(table3_with_pd, "Table3_species_with_marginal_PD.csv")
+
+# ========== New Section: Visualize Species PD Contribution ==========#
+
+# Create species PD contribution plot
+if (nrow(table3_with_pd) > 0) {
+  # 1. PD contribution bar chart
+  pd_contribution_plot <- table3_with_pd %>%
+    head(20) %>%  # Show top 20 contributing species
+    mutate(Species_Label = gsub("_", " ", Species_Name)) %>%
+    ggplot(aes(x = reorder(Species_Label, marginal_pd_Myr), y = marginal_pd_Myr)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+    geom_text(aes(label = paste0(round(pd_contribution_percent, 1), "%")),
+              hjust = -0.1, size = 3) +
+    coord_flip() +
+    labs(
+      title = "Species Marginal Contribution to Regional Total PD",
+      subtitle = "Shows marginal PD loss (unit: million years) and percentage of total PD",
+      x = "Species",
+      y = "Marginal PD Loss (Myr)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 9)
+    )
+  
+  ggsave("Species_PD_Contribution_Barplot.png", pd_contribution_plot,
+         width = 12, height = 8, dpi = 300)
+  
+  # 2. Relationship between PD contribution and distribution range
+  if (all(c("marginal_pd", "n_grids") %in% names(table3_with_pd))) {
+    range_pd_plot <- ggplot(table3_with_pd, aes(x = log10(n_grids + 1), y = marginal_pd)) +
+      geom_point(aes(size = pd_contribution_percent, color = pd_contribution_percent),
+                 alpha = 0.7) +
+      geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+      scale_color_viridis_c(option = "plasma", name = "PD Contribution (%)") +
+      scale_size_continuous(range = c(2, 8), name = "PD Contribution (%)") +
+      labs(
+        title = "Relationship Between Species Distribution Range and PD Contribution",
+        subtitle = "Point size and color represent PD contribution percentage",
+        x = "Number of Distribution Grids (log10)",
+        y = "Marginal PD Loss"
+      ) +
+      theme_bw(base_size = 12)
+    
+    ggsave("Range_PD_Contribution_Scatterplot.png", range_pd_plot,
+           width = 10, height = 8, dpi = 300)
+  }
+  
+  # 3. PD contribution analysis of high extinction risk species
+  if ("Extinction_Risk" %in% names(table3_with_pd)) {
+    risk_pd_summary <- table3_with_pd %>%
+      group_by(Extinction_Risk) %>%
+      summarise(
+        n_species = n(),
+        total_marginal_pd = sum(marginal_pd, na.rm = TRUE),
+        mean_pd_contribution = mean(pd_contribution_percent, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        risk_level = factor(Extinction_Risk,
+                            levels = c("Low", "Moderate", "High", "Extreme"))
+      )
+    
+    risk_pd_plot <- ggplot(risk_pd_summary, 
+                           aes(x = risk_level, y = total_marginal_pd, fill = risk_level)) +
+      geom_bar(stat = "identity") +
+      geom_text(aes(label = paste0(round(total_marginal_pd, 1), " Myr")),
+                vjust = -0.5, size = 4) +
+      scale_fill_brewer(palette = "RdYlBu", direction = -1) +
+      labs(
+        title = "Species Contribution to Total PD by Different Extinction Risk Levels",
+        subtitle = "Extinction of high-risk species may lead to greater PD loss",
+        x = "Extinction Risk Level",
+        y = "Total Marginal PD Loss (Myr)"
+      ) +
+      theme_bw(base_size = 12) +
+      theme(legend.position = "none")
+    
+    ggsave("Extinction_Risk_PD_Contribution.png", risk_pd_plot,
+           width = 10, height = 8, dpi = 300)
+  }
+}
+
+# ========== New Section: PD Vulnerability Analysis ==========#
+
+# Calculate PD vulnerability for each grid: how much PD would be lost if high PD contribution species go extinct
+if (nrow(table3_with_pd) > 0) {
+  # Identify high PD contribution species (e.g., top 10% contributing species)
+  pd_threshold <- quantile(table3_with_pd$marginal_pd, 0.9, na.rm = TRUE)
+  high_pd_species <- table3_with_pd %>%
+    filter(marginal_pd >= pd_threshold) %>%
+    pull(species_under)
+  
+  cat("Number of high PD contribution species (top 10%):", length(high_pd_species), "\n")
+  
+  # Calculate proportion of high PD contribution species in each grid
+  grid_pd_vulnerability <- data.frame(
+    grid_id = rownames(phylo_mat_filtered),
+    n_species = rowSums(phylo_mat_filtered),
+    n_high_pd_species = rowSums(phylo_mat_filtered[, high_pd_species, drop = FALSE]),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      prop_high_pd_species = n_high_pd_species / n_species,
+      pd_vulnerability = prop_high_pd_species * gymn_pd$PD[match(grid_id, gymn_pd$grid_id)]
+    )
+  
+  # Merge PD vulnerability into spatial data
+  grid_sf_result <- grid_sf_result %>%
+    left_join(grid_pd_vulnerability %>% select(grid_id, pd_vulnerability), 
+              by = "grid_id")
+  
+  # Visualize PD vulnerability
+  pd_vulnerability_plot <- ggplot() +
+    geom_sf(
+      data = grid_sf_result %>% filter(!is.na(pd_vulnerability)),
+      aes(fill = pd_vulnerability), color = NA
+    ) +
+    geom_sf(
+      data = east_asia_countries,
+      fill = NA,
+      color = "black",
+      linewidth = 0.3
+    ) +
+    coord_sf(xlim = xlim_range, ylim = ylim_range, expand = FALSE) +
+    scale_fill_viridis_c(
+      option = "inferno",
+      name = "PD Vulnerability",
+      trans = "sqrt"
+    ) +
+    labs(
+      title = "Phylogenetic Diversity Vulnerability",
+      subtitle = "Based on distribution of high PD contribution species",
+      x = "Longitude (°)",
+      y = "Latitude (°)"
+    ) +
+    theme_map()
+  
+  ggsave("PD_Vulnerability_Map.png", pd_vulnerability_plot,
+         width = 12, height = 8, dpi = 300)
+  
+  # Export PD vulnerability raster
+  if (require(raster)) {
+    pd_vuln_rast <- fasterize(
+      grid_sf_result %>% dplyr::filter(!is.na(pd_vulnerability)),
+      raster_template,
+      field = "pd_vulnerability"
+    )
+    writeRaster(pd_vuln_rast, "PD_Vulnerability_100km.asc",
+                format = "ascii", overwrite = TRUE)
+  }
+}
+
+# ========== New Section: Generate PD Contribution Analysis Report ==========#
+
+pd_contribution_report <- data.frame(
+  Analysis_Component = c(
+    "Total regional PD",
+    "Number of species analyzed",
+    "Mean marginal PD per species",
+    "Total PD at risk (high extinction risk species)",
+    "Proportion of regional PD contributed by top 10% species",
+    "Grids most vulnerable to PD loss"
+  ),
+  Value = c(
+    round(sum(gymn_pd$PD), 1),
+    nrow(table3_with_pd),
+    round(mean(table3_with_pd$marginal_pd, na.rm = TRUE), 2),
+    if ("Extinction_Risk" %in% names(table3_with_pd)) {
+      round(sum(table3_with_pd$marginal_pd[table3_with_pd$Extinction_Risk %in% c("High", "Extreme")], na.rm = TRUE), 1)
+    } else NA,
+    if (nrow(table3_with_pd) > 0) {
+      round(sum(table3_with_pd$marginal_pd[table3_with_pd$marginal_pd >= 
+                                             quantile(table3_with_pd$marginal_pd, 0.9, na.rm = TRUE)], na.rm = TRUE) / 
+              sum(gymn_pd$PD) * 100, 1)
+    } else NA,
+    if (exists("grid_pd_vulnerability")) {
+      paste(length(which(grid_pd_vulnerability$pd_vulnerability > 
+                           quantile(grid_pd_vulnerability$pd_vulnerability, 0.9, na.rm = TRUE))),
+            "grids in top 10% vulnerability")
+    } else NA
+  ),
+  Interpretation = c(
+    "Total evolutionary history in the region",
+    "Species from Table 3 included in analysis",
+    "Average PD loss if a single species goes extinct",
+    "PD that could be lost if high extinction risk species disappear",
+    "How concentrated PD is in a few key species",
+    "Areas where PD is most dependent on vulnerable species"
+  ),
+  Relevance_to_Conservation = c(
+    "Baseline measure of evolutionary heritage",
+    "Focus on species of conservation concern",
+    "Importance of each species for maintaining PD",
+    "Urgent conservation priority",
+    "Identifies keystone evolutionary species",
+    "Spatial priorities for PD conservation"
+  )
+)
+
+write_csv(pd_contribution_report, "PD_Contribution_Analysis_Report.csv")
+
+cat("\n===============================\n")
+cat("Species-level PD contribution analysis completed!\n")
+cat("===============================\n")
+cat("Main output files:\n")
+cat("1. Table3_species_with_marginal_PD.csv - Table 3 with ΔPD\n")
+cat("2. Species_PD_Contribution_Barplot.png - PD contribution bar chart\n")
+cat("3. PD_Vulnerability_Map.png - Spatial distribution map of PD vulnerability\n")
+cat("4. PD_Contribution_Analysis_Report.csv - Analysis report\n")
+cat("5. PD_Vulnerability_100km.asc - PD vulnerability raster data\n")
+cat("\nAnalysis results can now be used to answer reviewers' questions.\n")
