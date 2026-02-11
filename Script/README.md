@@ -34,6 +34,14 @@ Species distribution models (SDMs) were developed separately for species with di
 - **4.GymnospermSDM_model_predict_under20occ (Origin)**  
   Projection of optimized SDMs for species with fewer than 20 occurrence records across past, present, and future climate scenarios.
 
+  ### SDM analysis
+
+- **5.richness_maps**  
+  Script for generating spatial richness maps and visualizing diversity patterns derived from SDM outputs.
+
+- **6.Reclassification_and_Areas_calculation**  
+  Script for reclassifying model outputs (e.g., suitable/unsuitable) and calculating area statistics under different climate scenarios.
+
 ## Notes
 
 These scripts were used in the analyses presented in the associated manuscript. Users may need to adapt file paths and input data formats to their own systems.
